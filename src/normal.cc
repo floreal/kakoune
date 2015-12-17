@@ -349,7 +349,8 @@ void command(Context& context, NormalParams params)
             if (context.has_ui())
             {
                 context.ui().info_hide();
-                if (event == PromptEvent::Change and context.options()["autoinfo"].get<int>() > 0)
+                auto autoinfo = context.options()["autoinfo"].get<AutoInfo>();
+                if (event == PromptEvent::Change and autoinfo & AutoInfo::Command)
                 {
                     Face face = get_face("Information");
                     if (cmdline.length() == 1 and is_horizontal_blank(cmdline[0_byte]))
@@ -630,14 +631,20 @@ template<SelectMode mode, Direction direction>
 void search(Context& context, NormalParams params)
 {
     const char reg = to_lower(params.reg ? params.reg : '/');
+    int count = params.count;
     regex_prompt(context, direction == Forward ? "search:" : "reverse search:",
-                 [reg](Regex ex, PromptEvent event, Context& context) {
+                 [reg, count](Regex ex, PromptEvent event, Context& context) {
                      if (ex.empty())
                          ex = Regex{context.main_sel_register_value(reg)};
                      else if (event == PromptEvent::Validate)
                          RegisterManager::instance()[reg] = ex.str();
                      if (not ex.empty() and not ex.str().empty())
-                         select_next_match<direction, mode>(context.buffer(), context.selections(), ex);
+                     {
+                         int c = count;
+                         do {
+                             select_next_match<direction, mode>(context.buffer(), context.selections(), ex);
+                         } while (--c > 0);
+                     }
                  });
 }
 
@@ -697,26 +704,28 @@ void use_selection_as_search_pattern(Context& context, NormalParams params)
 void select_regex(Context& context, NormalParams params)
 {
     const char reg = to_lower(params.reg ? params.reg : '/');
-    regex_prompt(context, "select:", [reg](Regex ex, PromptEvent event, Context& context) {
+    unsigned capture = (unsigned)params.count;
+    regex_prompt(context, "select:", [reg, capture](Regex ex, PromptEvent event, Context& context) {
         if (ex.empty())
             ex = Regex{context.main_sel_register_value(reg)};
         else if (event == PromptEvent::Validate)
             RegisterManager::instance()[reg] = ex.str();
         if (not ex.empty() and not ex.str().empty())
-            select_all_matches(context.selections(), ex);
+            select_all_matches(context.selections(), ex, capture);
     });
 }
 
 void split_regex(Context& context, NormalParams params)
 {
     const char reg = to_lower(params.reg ? params.reg : '/');
-    regex_prompt(context, "split:", [reg](Regex ex, PromptEvent event, Context& context) {
+    unsigned capture = (unsigned)params.count;
+    regex_prompt(context, "split:", [reg, capture](Regex ex, PromptEvent event, Context& context) {
         if (ex.empty())
             ex = Regex{context.main_sel_register_value(reg)};
         else if (event == PromptEvent::Validate)
             RegisterManager::instance()[reg] = ex.str();
         if (not ex.empty() and not ex.str().empty())
-            split_selections(context.selections(), ex);
+            split_selections(context.selections(), ex, capture);
     });
 }
 
@@ -1142,6 +1151,12 @@ void push_selections(Context& context, NormalParams)
                            get_face("Information") });
 }
 
+void drop_jump(Context& context, NormalParams)
+{
+    context.drop_jump();
+    context.print_status({ "dropped last jump",  get_face("Information") });
+}
+
 void align(Context& context, NormalParams)
 {
     auto& selections = context.selections();
@@ -1306,6 +1321,7 @@ void save_selections(Context& context, NormalParams params)
     context.print_status({format("Saved selections in register '{}'", reg), get_face("Information")});
 }
 
+template<bool add>
 void restore_selections(Context& context, NormalParams params)
 {
     const char reg = to_lower(params.reg ? params.reg : '^');
@@ -1333,11 +1349,26 @@ void restore_selections(Context& context, NormalParams params)
 
     SelectionList sel_list{buffer, std::move(sels), timestamp};
 
-    if (&buffer != &context.buffer())
-        context.change_buffer(buffer);
+    if (not add)
+    {
+        if (&buffer != &context.buffer())
+            context.change_buffer(buffer);
+    }
+    else
+    {
+        if (&buffer != &context.buffer())
+            throw runtime_error("Cannot add selections from another buffer");
+
+        sel_list.update();
+        int main_index = sel_list.size() + context.selections_write_only().main_index();
+        for (auto& sel : context.selections())
+            sel_list.push_back(std::move(sel));
+
+        sel_list.set_main_index(main_index);
+        sel_list.sort_and_merge_overlapping();
+    }
 
     context.selections_write_only() = std::move(sel_list);
-
     context.print_status({format("Restored selections from register '{}'", reg), get_face("Information")});
 }
 
@@ -1620,6 +1651,7 @@ static NormalCmdDesc cmds[] =
     { ctrl('i'), "jump forward in jump list",jump<Forward> },
     { ctrl('o'), "jump backward in jump list", jump<Backward> },
     { ctrl('s'), "push current selections in jump list", push_selections },
+    { ctrl('d'), "drop last jump from jump list", drop_jump },
 
     { '\'', "rotate main selection", rotate_selections },
     { alt('\''), "rotate selections content", rotate_selections_content },
@@ -1655,7 +1687,8 @@ static NormalCmdDesc cmds[] =
     { Key::PageUp,   "scroll one page up", scroll<Key::PageUp> },
     { Key::PageDown, "scroll one page down", scroll<Key::PageDown> },
 
-    { 'z', "restore selections", restore_selections },
+    { 'z', "restore selections", restore_selections<false> },
+    { alt('z'), "append saved selections", restore_selections<true> },
     { 'Z', "save selections", save_selections },
 };
 

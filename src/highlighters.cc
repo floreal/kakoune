@@ -18,6 +18,7 @@
 #include "utf8_iterator.hh"
 
 #include <locale>
+#include <cstdio>
 
 namespace Kakoune
 {
@@ -192,12 +193,6 @@ private:
     ValueId m_id;
 };
 
-static bool overlaps(const BufferRange& lhs, const BufferRange& rhs)
-{
-    return lhs.begin < rhs.begin ? lhs.end > rhs.begin
-                                 : rhs.end > lhs.begin;
-}
-
 using FacesSpec = Vector<std::pair<size_t, String>, MemoryDomain::Highlight>;
 
 class RegexHighlighter : public Highlighter
@@ -211,6 +206,11 @@ public:
 
     void highlight(const Context& context, HighlightFlags flags, DisplayBuffer& display_buffer, BufferRange range) override
     {
+        auto overlaps = [](const BufferRange& lhs, const BufferRange& rhs) {
+            return lhs.begin < rhs.begin ? lhs.end > rhs.begin
+                                         : rhs.end > lhs.begin;
+        };
+
         if (flags != HighlightFlags::Highlight or not overlaps(display_buffer.range(), range))
             return;
 
@@ -449,6 +449,17 @@ HighlighterAndId create_dynamic_regex_highlighter(HighlighterParameters params)
     auto get_face = [faces](const Context& context){ return faces;; };
 
     String expr = params[0];
+    auto tokens = parse<true>(expr);
+    if (tokens.size() == 1 and tokens[0].type() == Token::Type::OptionExpand and
+        GlobalScope::instance().options()[tokens[0].content()].is_of_type<Regex>())
+    {
+        String option_name = tokens[0].content();
+        auto get_regex =  [option_name](const Context& context) {
+            return context.options()[option_name].get<Regex>();
+        };
+        return {format("dynregex_{}", expr), make_dynamic_regex_highlighter(get_regex, get_face)};
+    }
+
     auto get_regex = [expr](const Context& context){
         try
         {
@@ -893,31 +904,78 @@ HighlighterAndId create_flag_lines_highlighter(HighlighterParameters params)
     get_face(default_face); // validate param
 
     // throw if wrong option type
-    GlobalScope::instance().options()[option_name].get<Vector<LineAndFlag, MemoryDomain::Options>>();
+    GlobalScope::instance().options()[option_name].get<TimestampedList<LineAndFlag>>();
 
     auto func = [=](const Context& context, HighlightFlags flags,
                     DisplayBuffer& display_buffer, BufferRange)
     {
-        auto& lines_opt = context.options()[option_name];
-        auto& lines = lines_opt.get<Vector<LineAndFlag, MemoryDomain::Options>>();
+        auto& line_flags = context.options()[option_name].get_mutable<TimestampedList<LineAndFlag>>();
+        auto& lines = line_flags.list;
+
+        auto& buffer = context.buffer();
+        if (line_flags.timestamp != buffer.timestamp())
+        {
+            std::sort(lines.begin(), lines.end(),
+                      [](const LineAndFlag& lhs, const LineAndFlag& rhs)
+                      { return std::get<0>(lhs) < std::get<0>(rhs); });
+
+            auto modifs = compute_line_modifications(buffer, line_flags.timestamp);
+            auto ins_pos = lines.begin();
+            for (auto it = lines.begin(); it != lines.end(); ++it)
+            {
+                auto& line = std::get<0>(*it); // that line is 1 based as it comes from user side
+                auto modif_it = std::upper_bound(modifs.begin(), modifs.end(), line-1,
+                                                 [](const LineCount& l, const LineModification& c)
+                                                 { return l < c.old_line; });
+                if (modif_it != modifs.begin())
+                {
+                    auto& prev = *(modif_it-1);
+                    if (line-1 < prev.old_line + prev.num_removed)
+                        continue; // line removed
+
+                    line += prev.diff();
+                }
+
+                if (ins_pos != it)
+                    *ins_pos = std::move(*it);
+                ++ins_pos;
+            }
+            lines.erase(ins_pos, lines.end());
+            line_flags.timestamp = buffer.timestamp();
+        }
 
         auto def_face = get_face(default_face);
+        Vector<DisplayLine> display_lines;
+        for (auto& line : lines)
+        {
+            display_lines.push_back(parse_display_line(std::get<1>(line)));
+            for (auto& atom : display_lines.back())
+                atom.face = merge_faces(def_face, atom.face);
+        }
 
         CharCount width = 0;
-        for (auto& l : lines)
-             width = std::max(width, std::get<2>(l).char_length());
-        const String empty{' ', width};
+        for (auto& l : display_lines)
+             width = std::max(width, l.length());
+        const DisplayAtom empty{String{' ', width}, def_face};
         for (auto& line : display_buffer.lines())
         {
             int line_num = (int)line.range().begin.line + 1;
             auto it = find_if(lines,
                               [&](const LineAndFlag& l)
                               { return std::get<0>(l) == line_num; });
-            String content = it != lines.end() ? std::get<2>(*it) : empty;
-            content += String(' ', width - content.char_length());
-            DisplayAtom atom{std::move(content)};
-            atom.face = it != lines.end() ? merge_faces(get_face(std::get<1>(*it)), def_face) : def_face;
-            line.insert(line.begin(), std::move(atom));
+            if (it == lines.end())
+                line.insert(line.begin(), empty);
+            else
+            {
+                DisplayLine& display_line = display_lines[it - lines.begin()];
+                DisplayAtom padding_atom{String(' ', width - display_line.length()), def_face};
+                auto it = std::copy(std::make_move_iterator(display_line.begin()),
+                                    std::make_move_iterator(display_line.end()),
+                                    std::inserter(line, line.begin()));
+
+                if (padding_atom.length() != 0)
+                    *it++ = std::move(padding_atom);
+            }
         }
     };
 

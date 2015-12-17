@@ -1,4 +1,6 @@
 debug ?= yes
+pedantic ?= yes
+
 ifeq ($(debug),yes)
     CPPFLAGS += -DKAK_DEBUG
     suffix := .debug
@@ -11,6 +13,10 @@ else
     endif
 endif
 
+ifeq ($(pedantic),yes)
+    CXXFLAGS += -pedantic
+endif
+
 sources := $(wildcard *.cc)
 objects := $(addprefix ., $(sources:.cc=$(suffix).o))
 deps := $(addprefix ., $(sources:.cc=$(suffix).d))
@@ -18,11 +24,11 @@ deps := $(addprefix ., $(sources:.cc=$(suffix).d))
 PREFIX ?= /usr/local
 DESTDIR ?= # root dir
 
+NCURSESW_INCLUDE ?= /usr/include/ncursesw
+
 bindir := $(DESTDIR)$(PREFIX)/bin
 sharedir := $(DESTDIR)$(PREFIX)/share/kak
 docdir := $(DESTDIR)$(PREFIX)/share/doc/kak
-
-CXXFLAGS += -std=gnu++11 -g -Wall -Wno-reorder -Wno-sign-compare -pedantic
 
 os := $(shell uname)
 
@@ -42,9 +48,11 @@ else ifneq (,$(findstring CYGWIN,$(os)))
     LIBS += -lncursesw -lboost_regex -ldbghelp
 else
     LIBS += -lncursesw -lboost_regex
-    CPPFLAGS += -I/usr/include/ncursesw
+    CPPFLAGS += -I$(NCURSESW_INCLUDE)
     LDFLAGS += -rdynamic
 endif
+
+CXXFLAGS += -std=gnu++11 -g -Wall -Wno-reorder -Wno-sign-compare
 
 kak : $(objects)
 	$(CXX) $(LDFLAGS) $(CXXFLAGS) $(objects) $(LIBS) -o $@
@@ -64,10 +72,6 @@ clean:
 
 XDG_CONFIG_HOME ?= $(HOME)/.config
 
-userconfig:
-	mkdir -p $(XDG_CONFIG_HOME)/kak/autoload
-	ln -s $(CURDIR)/../rc/*.kak $(XDG_CONFIG_HOME)/kak/autoload/
-
 install: kak
 	mkdir -p $(bindir)
 	install -m 0755 kak $(bindir)
@@ -81,4 +85,4 @@ install: kak
 	install -m 0644 ../README.asciidoc $(docdir)
 	install -m 0644 ../doc/* $(docdir)
 
-.PHONY: tags userconfig install
+.PHONY: tags install

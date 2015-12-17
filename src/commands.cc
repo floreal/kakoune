@@ -659,7 +659,6 @@ const CommandDesc add_hook_cmd = {
             if (context.user_hooks_disabled())
                 return;
 
-            // Do not let hooks touch prompt history
             ScopedSetBool disable_history{context.history_disabled()};
 
             if (regex_match(param.begin(), param.end(), regex))
@@ -722,9 +721,23 @@ void define_command(const ParametersParser& parser, Context& context, const Shel
     const String& commands = parser[1];
     Command cmd;
     ParameterDesc desc;
-    if (parser.get_switch("shell-params"))
+    if (auto params = parser.get_switch("params"))
     {
-        desc = ParameterDesc{ {}, ParameterDesc::Flags::SwitchesAsPositional };
+        size_t min = 0, max = -1;
+        StringView counts = *params;
+        static const Regex re{R"((\d+)?..(\d+)?)"};
+        MatchResults<const char*> res;
+        if (regex_match(counts.begin(), counts.end(), res, re))
+        {
+            if (res[1].matched)
+                min = (size_t)str_to_int({res[1].first, res[1].second});
+            if (res[2].matched)
+                max = (size_t)str_to_int({res[2].first, res[2].second});
+        }
+        else
+            min = max = (size_t)str_to_int(counts);
+
+        desc = ParameterDesc{ {}, ParameterDesc::Flags::SwitchesAsPositional, min, max };
         cmd = [=](const ParametersParser& parser, Context& context, const ShellContext&) {
             CommandManager::instance().execute(commands, context, { params_to_shell(parser) });
         };
@@ -816,15 +829,16 @@ const CommandDesc define_command_cmd = {
     nullptr,
     "def <switches> <name> <cmds>: define a command <name> executing <cmds>",
     ParameterDesc{
-        { { "shell-params",      { false, "pass parameters to each shell escape as $0..$N" } },
-          { "allow-override",    { false, "allow overriding an existing command" } },
-          { "hidden",            { false, "do not display the command in completion candidates" } },
-          { "docstring",         { true,  "define the documentation string for command" } },
-          { "file-completion",   { false, "complete parameters using filename completion" } },
-          { "client-completion", { false, "complete parameters using client name completion" } },
-          { "buffer-completion", { false, "complete parameters using buffer name completion" } },
+        { { "params",             { true, "take parameters, accessible to each shell escape as $0..$N\n"
+                                          "parameter should take the form <count> or <min>..<max> (both omittable)" } },
+          { "allow-override",     { false, "allow overriding an existing command" } },
+          { "hidden",             { false, "do not display the command in completion candidates" } },
+          { "docstring",          { true,  "define the documentation string for command" } },
+          { "file-completion",    { false, "complete parameters using filename completion" } },
+          { "client-completion",  { false, "complete parameters using client name completion" } },
+          { "buffer-completion",  { false, "complete parameters using buffer name completion" } },
           { "command-completion", { false, "complete parameters using kakoune command completion" } },
-          { "shell-completion",  { true,  "complete the parameters using the given shell-script" } } },
+          { "shell-completion",   { true,  "complete the parameters using the given shell-script" } } },
         ParameterDesc::Flags::None,
         2, 2
     },
@@ -1071,10 +1085,10 @@ const CommandDesc unset_option_cmd = {
     },
     [](const ParametersParser& parser, Context& context, const ShellContext&)
     {
-        if (parser[0] == "global")
+        auto& options = get_options(parser[0], context, parser[1]);
+        if (&options == &GlobalScope::instance().options())
             throw runtime_error("Cannot unset options in global scope");
-
-        get_options(parser[0], context, parser[1]).unset_option(parser[1]);
+        options.unset_option(parser[1]);
     }
 };
 
@@ -1090,7 +1104,7 @@ const CommandDesc declare_option_cmd = {
     "    regex: regular expression\n"
     "    int-list: list of integers\n"
     "    str-list: list of character strings\n"
-    "    line-flag-list: list of line flags\n",
+    "    line-flags: list of line flags\n",
     ParameterDesc{
         { { "hidden",    { false, "do not display option name when completing" } },
           { "docstring", { true,  "specify option description" } } },
@@ -1122,8 +1136,8 @@ const CommandDesc declare_option_cmd = {
             opt = &reg.declare_option<Vector<int, MemoryDomain::Options>>(parser[1], docstring, {}, flags);
         else if (parser[0] == "str-list")
             opt = &reg.declare_option<Vector<String, MemoryDomain::Options>>(parser[1], docstring, {}, flags);
-        else if (parser[0] == "line-flag-list")
-            opt = &reg.declare_option<Vector<LineAndFlag, MemoryDomain::Options>>(parser[1], docstring, {}, flags);
+        else if (parser[0] == "line-flags")
+            opt = &reg.declare_option<TimestampedList<LineAndFlag>>(parser[1], docstring, {}, flags);
         else
             throw runtime_error(format("unknown type {}", parser[0]));
 
@@ -1198,7 +1212,8 @@ const ParameterDesc context_wrap_params = {
       { "draft",      { false, "run in a disposable context" } },
       { "no-hooks",   { false, "disable hooks" } },
       { "with-maps",  { false, "use user defined key mapping when executing keys" } },
-      { "itersel",    { false, "run once for each selection with that selection as the only one" } } },
+      { "itersel",    { false, "run once for each selection with that selection as the only one" } },
+      { "save-regs",  { true, "restore all given registers after execution" } } },
     ParameterDesc::Flags::SwitchesOnlyAtStart, 1
 };
 
@@ -1216,18 +1231,56 @@ private:
     T m_prev_value;
 };
 
+class RegisterRestorer
+{
+public:
+    RegisterRestorer(char name, const Context& context)
+      : m_name(name)
+    {
+        ConstArrayView<String> save = RegisterManager::instance()[name].values(context);
+        m_save = Vector<String>(save.begin(), save.end());
+    }
+
+    RegisterRestorer(RegisterRestorer&& other) noexcept
+        : m_save(std::move(other.m_save)), m_name(other.m_name)
+    {
+        other.m_name = 0;
+    }
+
+    RegisterRestorer& operator=(RegisterRestorer&& other) noexcept
+    {
+        m_save = std::move(other.m_save);
+        m_name = other.m_name;
+        other.m_name = 0;
+        return *this;
+    }
+
+    ~RegisterRestorer()
+    {
+        if (m_name != 0)
+            RegisterManager::instance()[m_name] = m_save;
+    }
+
+private:
+    Vector<String> m_save;
+    char           m_name;
+};
+
 template<typename Func>
 void context_wrap(const ParametersParser& parser, Context& context, Func func)
 {
     // Disable these options to avoid costly code paths (and potential screen
     // redraws) That are useful only in interactive contexts.
-    DisableOption<int> disable_autoinfo(context, "autoinfo");
+    DisableOption<AutoInfo> disable_autoinfo(context, "autoinfo");
     DisableOption<bool> disable_autoshowcompl(context, "autoshowcompl");
     DisableOption<bool> disable_incsearch(context, "incsearch");
 
-    const bool disable_hooks = parser.get_switch("no-hooks") or
-                               context.user_hooks_disabled();
-    const bool disable_keymaps = not parser.get_switch("with-maps");
+    const bool no_hooks = parser.get_switch("no-hooks") or context.user_hooks_disabled();
+    const bool no_keymaps = not parser.get_switch("with-maps");
+
+    Vector<RegisterRestorer> saved_registers;
+    for (auto& r : parser.get_switch("save-regs").value_or("/\"|^@"))
+        saved_registers.emplace_back(r, context);
 
     ClientManager& cm = ClientManager::instance();
     if (auto bufnames = parser.get_switch("buffer"))
@@ -1237,10 +1290,9 @@ void context_wrap(const ParametersParser& parser, Context& context, Func func)
                                        Context::Flags::Transient};
             Context& c = input_handler.context();
 
-            // Propagate user hooks disabled status to the temporary context
-            ScopedSetBool hook_disable(c.user_hooks_disabled(), disable_hooks);
-            ScopedSetBool keymaps_disable(c.keymaps_disabled(), disable_keymaps);
-            ScopedSetBool disable_history{c.history_disabled()};
+            ScopedSetBool disable_hooks(c.user_hooks_disabled(), no_hooks);
+            ScopedSetBool disable_keymaps(c.keymaps_disabled(), no_keymaps);
+            ScopedSetBool disable_history(c.history_disabled());
 
             func(parser, c);
         };
@@ -1274,9 +1326,9 @@ void context_wrap(const ParametersParser& parser, Context& context, Func func)
         if (real_context->is_editing())
             c.disable_undo_handling();
 
-        ScopedSetBool hook_disable(c.user_hooks_disabled(), disable_hooks);
-        ScopedSetBool keymaps_disable(c.keymaps_disabled(), disable_keymaps);
-        ScopedSetBool disable_history{c.history_disabled()};
+        ScopedSetBool disable_hooks(c.user_hooks_disabled(), no_hooks);
+        ScopedSetBool disable_keymaps(c.keymaps_disabled(), no_keymaps);
+        ScopedSetBool disable_history(c.history_disabled());
 
         if (parser.get_switch("itersel"))
         {
@@ -1301,11 +1353,13 @@ void context_wrap(const ParametersParser& parser, Context& context, Func func)
         if (parser.get_switch("itersel"))
             throw runtime_error("-itersel makes no sense without -draft");
 
-        ScopedSetBool hook_disable(real_context->user_hooks_disabled(), disable_hooks);
-        ScopedSetBool keymaps_disable(real_context->keymaps_disabled(), disable_keymaps);
-        ScopedSetBool disable_history{real_context->history_disabled()};
+        Context& c = *real_context;
 
-        func(parser, *real_context);
+        ScopedSetBool disable_hooks(c.user_hooks_disabled(), no_hooks);
+        ScopedSetBool disable_keymaps(c.keymaps_disabled(), no_keymaps);
+        ScopedSetBool disable_history(c.history_disabled());
+
+        func(parser, c);
     }
 }
 
@@ -1354,29 +1408,63 @@ const CommandDesc prompt_cmd = {
     "prompt <prompt> <register> <command>: prompt the use to enter a text string "
     "stores it in <register> and then executes <command>",
     ParameterDesc{
-        { { "init", { true, "set initial prompt content" } } },
+        { { "init", { true, "set initial prompt content" } },
+          { "file-completion", { false, "use file completion for prompt" } },
+          { "client-completion", { false, "use client completion for prompt" } },
+          { "buffer-completion", { false, "use buffer completion for prompt" } },
+          { "command-completion", { false, "use command completion for prompt" } } },
         ParameterDesc::Flags::None, 3, 3
     },
     CommandFlags::None,
     CommandHelper{},
     CommandCompleter{},
-    [](const ParametersParser& params, Context& context, const ShellContext&)
+    [](const ParametersParser& parser, Context& context, const ShellContext& shell_context)
     {
-        if (params[1].length() != 1)
+        if (parser[1].length() != 1)
             throw runtime_error("register name should be a single character");
-        const char reg = params[1][0_byte];
-        const String& command = params[2];
-        auto initstr = params.get_switch("init").value_or(StringView{});
+        const char reg = parser[1][0_byte];
+        const String& command = parser[2];
+        auto initstr = parser.get_switch("init").value_or(StringView{});
+
+        Completer completer;
+        if (parser.get_switch("file-completion"))
+            completer = [](const Context& context, CompletionFlags,
+                           StringView prefix, ByteCount cursor_pos) -> Completions {
+                auto& ignored_files = context.options()["ignored_files"].get<Regex>();
+                return { 0_byte, cursor_pos,
+                         complete_filename(prefix, ignored_files, cursor_pos) };
+            };
+        else if (parser.get_switch("client-completion"))
+            completer = [](const Context& context, CompletionFlags,
+                           StringView prefix, ByteCount cursor_pos) -> Completions {
+                 return { 0_byte, cursor_pos,
+                          ClientManager::instance().complete_client_name(prefix, cursor_pos) };
+            };
+        else if (parser.get_switch("buffer-completion"))
+            completer = [](const Context& context, CompletionFlags,
+                           StringView prefix, ByteCount cursor_pos) -> Completions {
+                 return { 0_byte, cursor_pos,
+                          complete_buffer_name(prefix, cursor_pos) };
+            };
+        else if (parser.get_switch("command-completion"))
+            completer = [](const Context& context, CompletionFlags flags,
+                           StringView prefix, ByteCount cursor_pos) -> Completions {
+                return CommandManager::instance().complete(
+                    context, flags, prefix, cursor_pos);
+            };
+
 
         context.input_handler().prompt(
-            params[0], initstr.str(), get_face("Prompt"), Completer{},
+            parser[0], initstr.str(), get_face("Prompt"), std::move(completer),
             [=](StringView str, PromptEvent event, Context& context)
             {
                 if (event != PromptEvent::Validate)
                     return;
                 RegisterManager::instance()[reg] = ConstArrayView<String>(str.str());
 
-                CommandManager::instance().execute(command, context);
+                ScopedSetBool disable_history{context.history_disabled()};
+
+                CommandManager::instance().execute(command, context, shell_context);
             });
     }
 };
@@ -1394,7 +1482,7 @@ const CommandDesc menu_cmd = {
     CommandFlags::None,
     CommandHelper{},
     CommandCompleter{},
-    [](const ParametersParser& parser, Context& context, const ShellContext&)
+    [](const ParametersParser& parser, Context& context, const ShellContext& shell_context)
     {
         const bool with_select_cmds = (bool)parser.get_switch("select-cmds");
         const bool markup = (bool)parser.get_switch("markup");
@@ -1406,6 +1494,8 @@ const CommandDesc menu_cmd = {
 
         if (count == modulo and parser.get_switch("auto-single"))
         {
+            ScopedSetBool disable_history{context.history_disabled()};
+
             CommandManager::instance().execute(parser[1], context);
             return;
         }
@@ -1424,10 +1514,12 @@ const CommandDesc menu_cmd = {
 
         context.input_handler().menu(choices,
             [=](int choice, MenuEvent event, Context& context) {
+                ScopedSetBool disable_history{context.history_disabled()};
+
                 if (event == MenuEvent::Validate and choice >= 0 and choice < commands.size())
-                  CommandManager::instance().execute(commands[choice], context);
+                  CommandManager::instance().execute(commands[choice], context, shell_context);
                 if (event == MenuEvent::Select and choice >= 0 and choice < select_cmds.size())
-                  CommandManager::instance().execute(select_cmds[choice], context);
+                  CommandManager::instance().execute(select_cmds[choice], context, shell_context);
             });
     }
 };
@@ -1440,14 +1532,16 @@ const CommandDesc onkey_cmd = {
     CommandFlags::None,
     CommandHelper{},
     CommandCompleter{},
-    [](const ParametersParser& parser, Context& context, const ShellContext&)
+    [](const ParametersParser& parser, Context& context, const ShellContext& shell_context)
     {
         String reg = parser[0];
         String command = parser[1];
         context.input_handler().on_next_key(KeymapMode::None,
                                             [=](Key key, Context& context) {
             RegisterManager::instance()[reg] = key_to_str(key);
-            CommandManager::instance().execute(command, context);
+            ScopedSetBool disable_history{context.history_disabled()};
+
+            CommandManager::instance().execute(command, context, shell_context);
         });
     }
 };
@@ -1617,34 +1711,15 @@ const CommandDesc change_working_directory_cmd = {
     {
         if (chdir(parse_filename(parser[0]).c_str()) != 0)
             throw runtime_error(format("cannot change to directory '{}'", parser[0]));
+        for (auto& buffer : BufferManager::instance())
+            buffer->update_display_name();
     }
-};
-
-class RegisterRestorer
-{
-public:
-    RegisterRestorer(char name, const Context& context)
-      : m_name(name)
-    {
-        ConstArrayView<String> save = RegisterManager::instance()[name].values(context);
-        m_save = Vector<String>(save.begin(), save.end());
-    }
-
-    ~RegisterRestorer()
-    { RegisterManager::instance()[m_name] = m_save; }
-
-private:
-    Vector<String> m_save;
-    char           m_name;
 };
 
 }
 
 void exec_keys(ConstArrayView<Key> keys, Context& context)
 {
-    RegisterRestorer quote('"', context);
-    RegisterRestorer slash('/', context);
-
     ScopedEdition edition(context);
 
     for (auto& key : keys)

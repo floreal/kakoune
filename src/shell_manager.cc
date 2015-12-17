@@ -5,6 +5,8 @@
 #include "event_manager.hh"
 #include "file.hh"
 
+#include <chrono>
+
 #include <cstring>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -27,7 +29,10 @@ namespace
 
 struct Pipe
 {
-    Pipe() { pipe(m_fd); }
+    Pipe() {
+        if (::pipe(m_fd) < 0)
+            throw runtime_error(format("unable to create pipe (fds: {}/{}; errno: {})", m_fd[0], m_fd[1], ::strerror(errno)));
+    }
     ~Pipe() { close_read_fd(); close_write_fd(); }
 
     int read_fd() const { return m_fd[0]; }
@@ -41,8 +46,9 @@ private:
     int m_fd[2];
 };
 
-pid_t spawn_process(StringView cmdline, ConstArrayView<String> params, ConstArrayView<String> kak_env,
-                    const Pipe& child_stdout, const Pipe& child_stdin, const Pipe& child_stderr)
+template<typename Func>
+pid_t spawn_shell(StringView cmdline, ConstArrayView<String> params,
+                  ConstArrayView<String> kak_env, Func setup_child)
 {
     Vector<const char*> envptrs;
     for (char** envp = environ; *envp; ++envp)
@@ -63,27 +69,14 @@ pid_t spawn_process(StringView cmdline, ConstArrayView<String> params, ConstArra
     if (pid_t pid = fork())
         return pid;
 
-    auto move = [](int oldfd, int newfd) { dup2(oldfd, newfd); close(oldfd); };
-
-    close(child_stdout.write_fd());
-    move(child_stdout.read_fd(), 0);
-
-    close(child_stdin.read_fd());
-    move(child_stdin.write_fd(), 1);
-
-    close(child_stderr.read_fd());
-    move(child_stderr.write_fd(), 2);
+    setup_child();
 
     execve(shell, (char* const*)execparams.data(), (char* const*)envptrs.data());
     exit(-1);
     return -1;
 }
 
-}
-
-std::pair<String, int> ShellManager::eval(
-    StringView cmdline, const Context& context, StringView input,
-    Flags flags, const ShellContext& shell_context)
+Vector<String> generate_env(StringView cmdline, const Context& context, const ShellContext& shell_context)
 {
     static const Regex re(R"(\bkak_(\w+)\b)");
 
@@ -104,22 +97,58 @@ std::pair<String, int> ShellManager::eval(
         try
         {
             const String& value = var_it != shell_context.env_vars.end() ?
-                var_it->value : get_val(name, context);
+                var_it->value : ShellManager::instance().get_val(name, context);
 
             kak_env.push_back(format("kak_{}={}", name, value));
         } catch (runtime_error&) {}
     }
 
+    return kak_env;
+}
+
+}
+
+std::pair<String, int> ShellManager::eval(
+    StringView cmdline, const Context& context, StringView input,
+    Flags flags, const ShellContext& shell_context)
+{
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+    const DebugFlags debug_flags = context.options()["debug"].get<DebugFlags>();
+    const bool profile = debug_flags & DebugFlags::Profile;
+    if (debug_flags & DebugFlags::Shell)
+        write_to_debug_buffer(format("shell:\n{}\n----\n", cmdline));
+
+    auto start_time = profile ? Clock::now() : TimePoint{};
+
+    auto kak_env = generate_env(cmdline, context, shell_context);
+
+    auto spawn_time = profile ? Clock::now() : TimePoint{};
+
     Pipe child_stdin, child_stdout, child_stderr;
-    pid_t pid = spawn_process(cmdline, shell_context.params, kak_env,
-                              child_stdin, child_stdout, child_stderr);
+    pid_t pid = spawn_shell(cmdline, shell_context.params, kak_env,
+                            [&child_stdin, &child_stdout, &child_stderr] {
+        auto move = [](int oldfd, int newfd) { dup2(oldfd, newfd); close(oldfd); };
+
+        close(child_stdin.write_fd());
+        move(child_stdin.read_fd(), 0);
+
+        close(child_stdout.read_fd());
+        move(child_stdout.write_fd(), 1);
+
+        close(child_stderr.read_fd());
+        move(child_stderr.write_fd(), 2);
+    });
 
     child_stdin.close_read_fd();
     child_stdout.close_write_fd();
     child_stderr.close_write_fd();
 
-    write(child_stdin.write_fd(), input.data(), (int)input.length());
+    write(child_stdin.write_fd(), input);
     child_stdin.close_write_fd();
+
+    auto wait_time = profile ? Clock::now() : TimePoint{};
 
     struct PipeReader : FDWatcher
     {
@@ -127,7 +156,7 @@ std::pair<String, int> ShellManager::eval(
             : FDWatcher(pipe.read_fd(),
                         [&contents, &pipe](FDWatcher& watcher, EventMode) {
                             char buffer[1024];
-                            size_t size = read(pipe.read_fd(), buffer, 1024);
+                            size_t size = ::read(pipe.read_fd(), buffer, 1024);
                             if (size <= 0)
                             {
                                 pipe.close_read_fd();
@@ -166,6 +195,16 @@ std::pair<String, int> ShellManager::eval(
 
     if (not stderr_contents.empty())
         write_to_debug_buffer(format("shell stderr: <<<\n{}>>>", stderr_contents));
+
+    if (profile)
+    {
+        TimePoint end_time = Clock::now();
+        auto full = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        auto spawn = std::chrono::duration_cast<std::chrono::milliseconds>(wait_time - spawn_time);
+        auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - wait_time);
+        write_to_debug_buffer(format("shell execution took {} ms (spawn: {}, wait: {})",
+                                     (size_t)full.count(), (size_t)spawn.count(), (size_t)wait.count()));
+    }
 
     return { stdout_contents, WIFEXITED(status) ? WEXITSTATUS(status) : -1 };
 }

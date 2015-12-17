@@ -67,24 +67,27 @@ void Client::handle_available_input(EventMode mode)
 
     try
     {
-        while (Optional<Key> key = get_next_key(mode))
+        try
         {
-            if (*key == ctrl('c'))
-                killpg(getpgrp(), SIGINT);
-            else if (*key == Key::FocusIn)
-                context().hooks().run_hook("FocusIn", context().name(), context());
-            else if (*key == Key::FocusOut)
-                context().hooks().run_hook("FocusOut", context().name(), context());
-            else if (key->modifiers == Key::Modifiers::Resize)
-                force_redraw();
-            else
-                m_input_handler.handle_key(*key);
+            while (Optional<Key> key = get_next_key(mode))
+            {
+                if (*key == ctrl('c'))
+                    killpg(getpgrp(), SIGINT);
+                else if (*key == Key::FocusIn)
+                    context().hooks().run_hook("FocusIn", context().name(), context());
+                else if (*key == Key::FocusOut)
+                    context().hooks().run_hook("FocusOut", context().name(), context());
+                else if (key->modifiers == Key::Modifiers::Resize)
+                    force_redraw();
+                else
+                    m_input_handler.handle_key(*key);
+            }
         }
-    }
-    catch (Kakoune::runtime_error& error)
-    {
-        context().print_status({ error.what().str(), get_face("Error") });
-        context().hooks().run_hook("RuntimeError", error.what(), context());
+        catch (Kakoune::runtime_error& error)
+        {
+            context().print_status({ error.what().str(), get_face("Error") });
+            context().hooks().run_hook("RuntimeError", error.what(), context());
+        }
     }
     catch (Kakoune::client_removed& removed)
     {
@@ -236,15 +239,15 @@ void Client::check_if_buffer_needs_reloading()
         return;
 
     Buffer& buffer = context().buffer();
-    auto reload = context().options()["autoreload"].get<YesNoAsk>();
-    if (not (buffer.flags() & Buffer::Flags::File) or reload == No)
+    auto reload = context().options()["autoreload"].get<Autoreload>();
+    if (not (buffer.flags() & Buffer::Flags::File) or reload == Autoreload::No)
         return;
 
     const String& filename = buffer.name();
     timespec ts = get_fs_timestamp(filename);
     if (ts == InvalidTime or ts == buffer.fs_timestamp())
         return;
-    if (reload == Ask)
+    if (reload == Autoreload::Ask)
     {
         m_ui->info_show(
             format("reload '{}' ?", buffer.display_name()),

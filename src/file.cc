@@ -100,7 +100,9 @@ String compact_path(StringView filename)
     String real_filename = real_path(filename);
 
     char cwd[1024];
-    getcwd(cwd, 1024);
+    if (!::getcwd(cwd, 1024))
+        throw runtime_error(format("unable to get the current working directory (errno: {})", ::strerror(errno)));
+
     String real_cwd = real_path(cwd) + "/";
     if (prefix_match(real_filename, real_cwd))
         return real_filename.substr(real_cwd.length()).str();
@@ -197,7 +199,7 @@ bool file_exists(StringView filename)
     return stat(real_filename.c_str(), &st) == 0;
 }
 
-static void write(int fd, StringView data)
+void write(int fd, StringView data)
 {
     const char* ptr = data.data();
     ssize_t count   = (int)data.length();
@@ -215,15 +217,16 @@ static void write(int fd, StringView data)
 
 void write_buffer_to_fd(Buffer& buffer, int fd)
 {
-    const String& eolformat = buffer.options()["eolformat"].get<String>();
+    auto eolformat = buffer.options()["eolformat"].get<EolFormat>();
     StringView eoldata;
-    if (eolformat == "crlf")
+    if (eolformat == EolFormat::Crlf)
         eoldata = "\r\n";
     else
         eoldata = "\n";
 
-    if (buffer.options()["BOM"].get<String>() == "utf-8")
-        ::write(fd, "\xEF\xBB\xBF", 3);
+    if (buffer.options()["BOM"].get<ByteOrderMark>() == ByteOrderMark::Utf8)
+        if (::write(fd, "\xEF\xBB\xBF", 3) < 0)
+            throw runtime_error(format("unable to write data to the buffer (fd: {}; errno: {})", fd, ::strerror(errno)));
 
     for (LineCount i = 0; i < buffer.line_count(); ++i)
     {

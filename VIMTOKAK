@@ -2,9 +2,9 @@ Vi(m) to Kakoune:
 =================
 
 Kakoune is inspired heavily by Vim, it strives to be as efficient as Vim,
-more consistent and simpler. A big differences is that a lot of special
-features in Vim just become regular interaction of basic features in
-Kakoune. 
+more consistent and simpler. A big difference is that a lot of special
+features in Vim just become regular interactions of basic features in
+Kakoune.
 
 Operations and moves are reversed in Kakoune. First select whatever text
 you want to operate on, and then use an modifying operation. That makes
@@ -50,7 +50,7 @@ join line with next:
 
 delete to line end:
  * vim: d$
- * kak: alt-ld or gld
+ * kak: alt-ld or Gld
 
 some classic vim moves are not bound to the same key, this is due to Kakoune
 using shifted moves to append to selection, so moves that were bound to non
@@ -65,4 +65,4 @@ alphabetic chars had to change.
 :[gv]/re/cmd
 to emulate :g or :v, use % to select the whole buffer, alt-s to get
 one selection by line, and then alt-k or alt-K in order to keep only the
-selections matching (or not matching) the entered regex. 
+selections matching (or not matching) the entered regex.

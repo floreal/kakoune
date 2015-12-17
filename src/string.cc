@@ -10,6 +10,8 @@
 namespace Kakoune
 {
 
+const String String::ms_empty;
+
 Vector<String> split(StringView str, char separator, char escape)
 {
     Vector<String> res;
@@ -44,6 +46,9 @@ Vector<String> split(StringView str, char separator, char escape)
 Vector<StringView> split(StringView str, char separator)
 {
     Vector<StringView> res;
+    if (str.empty())
+        return res;
+
     auto beg = str.begin();
     for (auto it = beg; it != str.end(); ++it)
     {

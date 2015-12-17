@@ -44,6 +44,7 @@ public:
     virtual ~Option() = default;
 
     template<typename T> const T& get() const;
+    template<typename T> T& get_mutable();
     template<typename T> void set(const T& val, bool notify=true);
     template<typename T> bool is_of_type() const;
 
@@ -122,6 +123,7 @@ public:
         }
     }
     const T& get() const { return m_value; }
+    T& get_mutable() { return m_value; }
 
     String get_as_string() const override
     {
@@ -135,9 +137,7 @@ public:
     }
     void add_from_string(StringView str) override
     {
-        T val;
-        option_from_string(str, val);
-        if (option_add(m_value, val))
+        if (option_add(m_value, str))
             m_manager.on_option_changed(*this);
     }
 
@@ -167,6 +167,11 @@ template<typename T> const T& Option::get() const
     if (not typed_opt)
         throw runtime_error(format("option '{}' is not of type '{}'", name(), typeid(T).name()));
     return typed_opt->get();
+}
+
+template<typename T> T& Option::get_mutable()
+{
+    return const_cast<T&>(get<T>());
 }
 
 template<typename T> void Option::set(const T& val, bool notify)

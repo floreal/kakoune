@@ -7,6 +7,8 @@
 #include "coord.hh"
 #include "array_view.hh"
 #include "id_map.hh"
+#include "flags.hh"
+#include "enum.hh"
 
 #include <tuple>
 #include <vector>
@@ -16,11 +18,16 @@ namespace Kakoune
 
 inline String option_to_string(StringView opt) { return opt.str(); }
 inline void option_from_string(StringView str, String& opt) { opt = str.str(); }
-inline bool option_add(String& opt, const String& val) { opt += val; return not val.empty(); }
+inline bool option_add(String& opt, StringView val) { opt += val; return not val.empty(); }
 
 inline String option_to_string(int opt) { return to_string(opt); }
 inline void option_from_string(StringView str, int& opt) { opt = str_to_int(str); }
-inline bool option_add(int& opt, int val) { opt += val; return val != 0; }
+inline bool option_add(int& opt, StringView str)
+{
+    auto val = str_to_int(str);
+    opt += val;
+    return val != 0;
+}
 
 inline String option_to_string(bool opt) { return opt ? "true" : "false"; }
 inline void option_from_string(StringView str, bool& opt)
@@ -62,9 +69,13 @@ void option_from_string(StringView str, Vector<T, domain>& opt)
 }
 
 template<typename T, MemoryDomain domain>
-bool option_add(Vector<T, domain>& opt, const Vector<T, domain>& vec)
+bool option_add(Vector<T, domain>& opt, StringView str)
 {
-    std::copy(vec.begin(), vec.end(), back_inserter(opt));
+    Vector<T, domain> vec;
+    option_from_string(str, vec);
+    std::copy(std::make_move_iterator(vec.begin()),
+              std::make_move_iterator(vec.end()),
+              back_inserter(opt));
     return not vec.empty();
 }
 
@@ -163,14 +174,15 @@ inline void option_from_string(StringView str, StronglyTypedNumber<RealType, Val
 
 template<typename RealType, typename ValueType>
 inline bool option_add(StronglyTypedNumber<RealType, ValueType>& opt,
-                       StronglyTypedNumber<RealType, ValueType> val)
+                       StringView str)
 {
+    int val = str_to_int(str);
     opt += val;
     return val != 0;
 }
 
 template<typename T>
-bool option_add(T&, const T&)
+bool option_add(T&, StringView str)
 {
     throw runtime_error("no add operation supported for this option type");
 }
@@ -191,35 +203,64 @@ inline String option_to_string(const LineAndColumn<EffectiveType, LineType, Colu
     return format("{},{}", opt.line, opt.column);
 }
 
-enum YesNoAsk
+enum class DebugFlags
 {
-    Yes,
-    No,
-    Ask
+    None  = 0,
+    Hooks = 1 << 0,
+    Shell = 1 << 1,
+    Profile = 1 << 2,
 };
 
-inline String option_to_string(YesNoAsk opt)
+template<>
+struct WithBitOps<DebugFlags> : std::true_type {};
+
+constexpr Array<EnumDesc<DebugFlags>, 3> enum_desc(DebugFlags)
 {
-    switch (opt)
-    {
-        case Yes: return "yes";
-        case No:  return "no";
-        case Ask: return "ask";
-    }
-    kak_assert(false);
-    return "ask";
+    return { {
+        { DebugFlags::Hooks, "hooks" },
+        { DebugFlags::Shell, "shell" },
+        { DebugFlags::Profile, "profile" }
+    } };
 }
 
-inline void option_from_string(StringView str, YesNoAsk& opt)
+template<typename T>
+struct TimestampedList
 {
-    if (str == "yes" or str == "true")
-        opt = Yes;
-    else if (str == "no" or str == "false")
-        opt = No;
-    else if (str == "ask")
-        opt = Ask;
-    else
-        throw runtime_error(format("invalid value '{}', expected yes, no or ask", str));
+    size_t timestamp;
+    Vector<T, MemoryDomain::Options> list;
+};
+
+template<typename T>
+inline bool operator==(const TimestampedList<T>& lhs, const TimestampedList<T>& rhs)
+{
+    return lhs.timestamp == rhs.timestamp and lhs.list == rhs.list;
+}
+
+template<typename T>
+inline bool operator!=(const TimestampedList<T>& lhs, const TimestampedList<T>& rhs)
+{
+    return not (lhs == rhs);
+}
+
+template<typename T>
+inline String option_to_string(const TimestampedList<T>& opt)
+{
+    return format("{}:{}", opt.timestamp, option_to_string(opt.list));
+}
+
+template<typename T>
+inline void option_from_string(StringView str, TimestampedList<T>& opt)
+{
+    auto it = find(str, ':');
+    opt.timestamp = str_to_int({str.begin(), it});
+    if (it != str.end())
+        option_from_string({it+1, str.end()}, opt.list);
+}
+
+template<typename T>
+inline bool option_add(TimestampedList<T>& opt, StringView str)
+{
+    return option_add(opt.list, str);
 }
 
 }

@@ -44,14 +44,6 @@ String runtime_directory()
     return "/usr/share/kak";
 }
 
-static void write(int fd, StringView str)
-{
-    write(fd, str.data(), (size_t)(int)str.length());
-}
-
-static void write_stdout(StringView str) { write(1, str); }
-static void write_stderr(StringView str) { write(2, str); }
-
 void register_env_vars()
 {
     static const struct {
@@ -147,6 +139,11 @@ void register_env_vars()
 
 void register_registers()
 {
+    RegisterManager& register_manager = RegisterManager::instance();
+
+    for (auto c : "abcdefghijklmnopqrstuvwxyz/\"|^@")
+        register_manager.add_register(c, make_unique<StaticRegister>());
+
     using StringList = Vector<String, MemoryDomain::Registers>;
     static const struct {
         char name;
@@ -165,20 +162,21 @@ void register_registers()
         } }
     };
 
-    RegisterManager& register_manager = RegisterManager::instance();
     for (auto& dyn_reg : dyn_regs)
-        register_manager.register_dynamic_register(dyn_reg.name, dyn_reg.func);
+        register_manager.add_register(dyn_reg.name, make_unique<DynamicRegister>(dyn_reg.func));
 
     for (size_t i = 0; i < 10; ++i)
     {
-        register_manager.register_dynamic_register('0'+i,
+        register_manager.add_register('0'+i, make_unique<DynamicRegister>(
             [i](const Context& context) {
                 StringList result;
                 for (auto& sel : context.selections())
                     result.emplace_back(i < sel.captures().size() ? sel.captures()[i] : "");
                 return result;
-            });
+            }));
     }
+
+    register_manager.add_register('_', make_unique<NullRegister>());
 }
 
 void register_options()
@@ -190,9 +188,9 @@ void register_options()
     reg.declare_option("scrolloff",
                        "number of lines and columns to keep visible main cursor when scrolling",
                        CharCoord{0,0});
-    reg.declare_option("eolformat", "end of line format: 'crlf' or 'lf'", "lf"_str);
-    reg.declare_option("BOM", "insert a byte order mark when writing buffer",
-                       "no"_str);
+    reg.declare_option("eolformat", "end of line format: crlf or lf", EolFormat::Lf);
+    reg.declare_option("BOM", "insert a byte order mark when writing buffer (none or utf8)",
+                       ByteOrderMark::None);
     reg.declare_option("complete_prefix",
                        "complete up to common prefix in tab completion",
                        true);
@@ -201,7 +199,7 @@ void register_options()
                        true);
     reg.declare_option("autoinfo",
                        "automatically display contextual help",
-                       1);
+                       AutoInfo::Command | AutoInfo::OnKey);
     reg.declare_option("autoshowcompl",
                        "automatically display possible completions for prompts",
                        true);
@@ -224,7 +222,7 @@ void register_options()
                        }), OptionFlags::None);
     reg.declare_option("autoreload",
                        "autoreload buffer when a filesystem modification is detected",
-                       Ask);
+                       Autoreload::Ask);
     reg.declare_option("ui_options",
                        "colon separated list of <key>=<value> options that are "
                        "passed to and interpreted by the user interface\n"
@@ -240,6 +238,7 @@ void register_options()
                        UserInterface::Options{});
     reg.declare_option("modelinefmt", "format string used to generate the modeline",
                        "%val{bufname} %val{cursor_line}:%val{cursor_char_column} "_str);
+    reg.declare_option("debug", "various debug flags", DebugFlags::None);
 }
 
 struct convert_to_client_mode
@@ -356,18 +355,6 @@ std::unique_ptr<UserInterface> create_local_ui(bool dummy_ui)
     }
 
     return make_unique<LocalUI>();
-}
-
-void create_local_client(std::unique_ptr<UserInterface> ui, StringView init_command, bool startup_error)
-{
-     local_client = ClientManager::instance().create_client(
-        std::move(ui), get_env_vars(), init_command);
-
-    if (startup_error)
-        local_client->print_status({
-            "error during startup, see *debug* buffer for details",
-            get_face("Error")
-        });
 }
 
 void signal_handler(int signal)
@@ -519,7 +506,16 @@ int run_server(StringView session, StringView init_command,
         new Buffer("*scratch*", Buffer::Flags::None);
 
     if (not daemon)
-        create_local_client(create_local_ui(dummy_ui), init_command, startup_error);
+    {
+         local_client = client_manager.create_client(
+            create_local_ui(dummy_ui), get_env_vars(), init_command);
+
+        if (startup_error)
+            local_client->print_status({
+                "error during startup, see *debug* buffer for details",
+                get_face("Error")
+            });
+    }
 
     try
     {
@@ -557,23 +553,27 @@ int run_server(StringView session, StringView init_command,
     return 0;
 }
 
-int run_filter(StringView keystr, ConstArrayView<StringView> files, bool quiet)
+int run_filter(StringView keystr, StringView commands, ConstArrayView<StringView> files, bool quiet)
 {
     StringRegistry  string_registry;
     GlobalScope     global_scope;
+    EventManager    event_manager;
     ShellManager    shell_manager;
+    CommandManager  command_manager;
     BufferManager   buffer_manager;
     RegisterManager register_manager;
+    ClientManager   client_manager;
 
     register_options();
     register_env_vars();
     register_registers();
+    register_commands();
 
     try
     {
         auto keys = parse_keys(keystr);
 
-        auto apply_keys_to_buffer = [&](Buffer& buffer)
+        auto apply_to_buffer = [&](Buffer& buffer)
         {
             try
             {
@@ -581,6 +581,10 @@ int run_filter(StringView keystr, ConstArrayView<StringView> files, bool quiet)
                     { buffer, Selection{{0,0}, buffer.back_coord()} },
                     Context::Flags::Transient
                 };
+
+                if (not commands.empty())
+                    command_manager.execute(commands, input_handler.context(),
+                                            ShellContext{});
 
                 for (auto& key : keys)
                     input_handler.handle_key(key);
@@ -597,7 +601,7 @@ int run_filter(StringView keystr, ConstArrayView<StringView> files, bool quiet)
         {
             Buffer* buffer = open_file_buffer(file);
             write_buffer_to_file(*buffer, file + ".kak-bak");
-            apply_keys_to_buffer(*buffer);
+            apply_to_buffer(*buffer);
             write_buffer_to_file(*buffer, file);
             buffer_manager.delete_buffer(*buffer);
         }
@@ -605,7 +609,7 @@ int run_filter(StringView keystr, ConstArrayView<StringView> files, bool quiet)
         {
             Buffer* buffer = new Buffer("*stdin*", Buffer::Flags::None,
                                         read_fd(0), InvalidTime);
-            apply_keys_to_buffer(*buffer);
+            apply_to_buffer(*buffer);
             write_buffer_to_fd(*buffer, 1);
             buffer_manager.delete_buffer(*buffer);
         }
@@ -698,16 +702,17 @@ int main(int argc, char* argv[])
             }
             return run_pipe(*session);
         }
-        else if (auto keys = parser.get_switch("f"))
+
+        auto init_command = parser.get_switch("e").value_or(StringView{});
+
+        if (auto keys = parser.get_switch("f"))
         {
             Vector<StringView> files;
             for (size_t i = 0; i < parser.positional_count(); ++i)
                 files.emplace_back(parser[i]);
 
-            return run_filter(*keys, files, (bool)parser.get_switch("q"));
+            return run_filter(*keys, init_command, files, (bool)parser.get_switch("q"));
         }
-
-        auto init_command = parser.get_switch("e").value_or(StringView{});
 
         if (auto server_session = parser.get_switch("c"))
         {
@@ -719,7 +724,11 @@ int main(int argc, char* argv[])
                     return -1;
                 }
             }
-            return run_client(*server_session, init_command);
+            String new_files;
+            for (auto name : parser)
+                new_files += format("edit '{}';", escape(real_path(name), "'", '\\'));
+
+            return run_client(*server_session, new_files + init_command);
         }
         else
         {

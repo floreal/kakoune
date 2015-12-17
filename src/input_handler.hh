@@ -87,15 +87,15 @@ private:
     Context m_context;
 
     friend class InputMode;
-    Vector<std::unique_ptr<InputMode>> m_mode_stack;
+    Vector<RefPtr<InputMode>> m_mode_stack;
 
     InputMode& current_mode() const { return *m_mode_stack.back(); }
 
     void push_mode(InputMode* new_mode);
-    std::unique_ptr<InputMode> pop_mode(InputMode* current_mode);
+    void pop_mode(InputMode* current_mode);
 
-    struct Insertion{ InsertMode mode; Vector<Key> keys; };
-    Insertion m_last_insert = {InsertMode::Insert, {}};
+    struct Insertion{ InsertMode mode; Vector<Key> keys; bool disable_hooks; };
+    Insertion m_last_insert = { InsertMode::Insert, {}, false };
 
     char   m_recording_reg = 0;
     String m_recorded_keys;
@@ -103,13 +103,33 @@ private:
     int    m_handle_key_level = 0;
 };
 
-bool show_auto_info_ifn(StringView title, StringView info, const Context& context);
+enum class AutoInfo
+{
+    None = 0,
+    Command = 1 << 0,
+    OnKey   = 1 << 1,
+    Normal  = 1 << 2
+};
+
+template<>
+struct WithBitOps<AutoInfo> : std::true_type {};
+
+constexpr Array<EnumDesc<AutoInfo>, 3> enum_desc(AutoInfo)
+{
+    return { {
+        { AutoInfo::Command, "command"},
+        { AutoInfo::OnKey, "onkey"},
+        { AutoInfo::Normal, "normal" }
+    } };
+}
+
+bool show_auto_info_ifn(StringView title, StringView info, AutoInfo mask, const Context& context);
 
 template<typename Cmd>
 void on_next_key_with_autoinfo(const Context& context, KeymapMode keymap_mode, Cmd cmd,
                                StringView title, StringView info)
 {
-    const bool hide = show_auto_info_ifn(title, info, context);
+    const bool hide = show_auto_info_ifn(title, info, AutoInfo::OnKey, context);
     context.input_handler().on_next_key(
         keymap_mode, [hide,cmd](Key key, Context& context) mutable {
             if (hide)

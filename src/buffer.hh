@@ -12,6 +12,34 @@
 namespace Kakoune
 {
 
+enum class EolFormat
+{
+    Lf,
+    Crlf
+};
+
+constexpr Array<EnumDesc<EolFormat>, 2> enum_desc(EolFormat)
+{
+    return { {
+        { EolFormat::Lf, "lf" },
+        { EolFormat::Crlf, "crlf" },
+    } };
+}
+
+enum class ByteOrderMark
+{
+    None,
+    Utf8
+};
+
+constexpr Array<EnumDesc<ByteOrderMark>, 2> enum_desc(ByteOrderMark)
+{
+    return { {
+        { ByteOrderMark::None, "none" },
+        { ByteOrderMark::Utf8, "utf8" },
+    } };
+}
+
 class Buffer;
 
 constexpr timespec InvalidTime = { -1, -1 };
@@ -90,6 +118,7 @@ public:
     Flags& flags() { return m_flags; }
 
     bool set_name(String name);
+    void update_display_name();
 
     BufferIterator insert(const BufferIterator& pos, StringView content);
     BufferIterator erase(BufferIterator begin, BufferIterator end);

@@ -9,10 +9,15 @@ namespace Kakoune
 
 static Face parse_face(StringView facedesc)
 {
+    constexpr StringView invalid_face_error = "invalid face description, expected <fg>[,<bg>][+<attr>]";
     auto bg_it = find(facedesc, ',');
     auto attr_it = find(facedesc, '+');
-    if (bg_it != facedesc.end() and attr_it < bg_it)
-        throw runtime_error("invalid face description, expected <fg>[,<bg>][+<attr>]");
+    if (bg_it != facedesc.end()
+        and (attr_it < bg_it or (bg_it + 1) == facedesc.end()))
+        throw runtime_error(invalid_face_error.str());
+    if (attr_it != facedesc.end()
+        and (attr_it + 1) == facedesc.end())
+        throw runtime_error(invalid_face_error.str());
     Face res;
     res.fg = attr_it != facedesc.begin() ?
         str_to_color({facedesc.begin(), std::min(attr_it, bg_it)}) : Color::Default;
@@ -110,6 +115,9 @@ FaceRegistry::FaceRegistry()
         { "Information", Face{ Color::Black, Color::Yellow } },
         { "Error", Face{ Color::Black, Color::Red } },
         { "StatusLine", Face{ Color::Cyan, Color::Default } },
+        { "StatusLineMode", Face{ Color::Yellow, Color::Default } },
+        { "StatusLineInfo", Face{ Color::Blue, Color::Default } },
+        { "StatusLineValue", Face{ Color::Green, Color::Default } },
         { "StatusCursor", Face{ Color::Black, Color::Cyan } },
         { "Prompt", Face{ Color::Yellow, Color::Default } },
         { "MatchingChar", Face{ Color::Default, Color::Default, Attribute::Bold } },

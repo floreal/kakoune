@@ -3,6 +3,7 @@
 #include "containers.hh"
 #include "display_buffer.hh"
 #include "event_manager.hh"
+#include "file.hh"
 #include "keys.hh"
 #include "register_manager.hh"
 #include "utf8_iterator.hh"
@@ -405,7 +406,7 @@ void NCursesUI::draw_status(const DisplayLine& status_line,
         for (auto& atom : mode_line)
             title += atom.content();
         title += " - Kakoune\007";
-        write(1, title.data(), (int)title.length());
+        write_stdout(title);
     }
 
     m_dirty = true;
@@ -438,7 +439,7 @@ void NCursesUI::check_resize(bool force)
         m_dimensions = CharCoord{ws.ws_row-1, ws.ws_col};
 
         if (char* csr = tigetstr((char*)"csr"))
-            putp(tparm(csr, (long)0, (long)ws.ws_row));
+            putp(csr);
 
         if (menu)
         {
@@ -644,18 +645,23 @@ void NCursesUI::menu_show(ConstArrayView<DisplayLine> items,
     const int item_count = items.size();
     m_items.clear(); // make sure it is empty
     m_items.reserve(item_count);
-    CharCount longest = 0;
-    const CharCount maxlen = min((int)maxsize.column-1, 200);
+    CharCount longest = 1;
+    for (auto& item : items)
+        longest = max(longest, item.length());
+
+    const bool is_prompt = style == MenuStyle::Prompt;
+    m_menu_columns = is_prompt ? max((int)((maxsize.column-1) / (longest+1)), 1) : 1;
+
+    CharCount maxlen = maxsize.column-1;
+    if (m_menu_columns > 1 and item_count > 1)
+        maxlen = maxlen / m_menu_columns - 1;
+
     for (auto& item : items)
     {
         m_items.push_back(item);
         m_items.back().trim(0, maxlen, false);
-        longest = max(longest, m_items.back().length());
+        kak_assert(m_items.back().length() <= maxlen);
     }
-    longest += 1;
-
-    const bool is_prompt = style == MenuStyle::Prompt;
-    m_menu_columns = is_prompt ? (int)((maxsize.column - 1) / longest) : 1;
 
     int height = min(10, div_round_up(item_count, m_menu_columns));
 
@@ -665,7 +671,7 @@ void NCursesUI::menu_show(ConstArrayView<DisplayLine> items,
     m_selected_item = item_count;
     m_menu_top_line = 0;
 
-    int width = is_prompt ? (int)maxsize.column : (int)longest;
+    auto width = is_prompt ? maxsize.column : min(longest+1, maxsize.column);
     m_menu.create({line, anchor.column}, {height, width});
     draw_menu();
 }
@@ -729,10 +735,9 @@ static CharCoord compute_needed_size(StringView str)
     return res;
 }
 
-static CharCoord compute_pos(CharCoord anchor, CharCoord size, CharCoord scrsize,
-                             CharCoord rect_to_avoid_pos = CharCoord{},
-                             CharCoord rect_to_avoid_size = CharCoord{},
-                             bool prefer_above = false)
+static CharCoord compute_pos(CharCoord anchor, CharCoord size,
+                             NCursesUI::Rect rect, NCursesUI::Rect to_avoid,
+                             bool prefer_above)
 {
     CharCoord pos;
     if (prefer_above)
@@ -741,30 +746,30 @@ static CharCoord compute_pos(CharCoord anchor, CharCoord size, CharCoord scrsize
         if (pos.line < 0)
             prefer_above = false;
     }
+    auto rect_end = rect.pos + rect.size;
     if (not prefer_above)
     {
         pos = anchor + CharCoord{1_line};
-        if (pos.line + size.line >= scrsize.line)
-            pos.line = max(0_line, anchor.line - size.line);
+        if (pos.line + size.line > rect_end.line)
+            pos.line = max(rect.pos.line, anchor.line - size.line);
     }
-    if (pos.column + size.column >= scrsize.column)
-        pos.column = max(0_char, scrsize.column - size.column);
+    if (pos.column + size.column > rect_end.column)
+        pos.column = max(rect.pos.column, rect_end.column - size.column);
 
-    if (rect_to_avoid_size != CharCoord{})
+    if (to_avoid.size != CharCoord{})
     {
-        CharCoord rectbeg = rect_to_avoid_pos;
-        CharCoord rectend = rectbeg + rect_to_avoid_size;
+        CharCoord to_avoid_end = to_avoid.pos + to_avoid.size;
 
         CharCoord end = pos + size;
 
         // check intersection
-        if (not (end.line < rectbeg.line or end.column < rectbeg.column or
-                 pos.line > rectend.line or pos.column > rectend.column))
+        if (not (end.line < to_avoid.pos.line or end.column < to_avoid.pos.column or
+                 pos.line > to_avoid_end.line or pos.column > to_avoid_end.column))
         {
-            pos.line = min(rectbeg.line, anchor.line) - size.line;
+            pos.line = min(to_avoid.pos.line, anchor.line) - size.line;
             // if above does not work, try below
             if (pos.line < 0)
-                pos.line = max(rectend.line, anchor.line);
+                pos.line = max(to_avoid_end.line, anchor.line);
         }
     }
 
@@ -859,14 +864,14 @@ void NCursesUI::info_show(StringView title, StringView content,
     }
 
     CharCoord size = compute_needed_size(info_box), pos;
+    const Rect rect = {m_status_on_top ? 1_line : 0_line, m_dimensions};
     if (style == InfoStyle::MenuDoc and m_menu)
         pos = m_menu.pos + CharCoord{0_line, m_menu.size.column};
     else
-        pos = compute_pos(anchor, size, m_dimensions, m_menu.pos, m_menu.size,
-                          style == InfoStyle::InlineAbove);
+        pos = compute_pos(anchor, size, rect, m_menu, style == InfoStyle::InlineAbove);
 
-    // The info window will hide the status line
-    if (pos.line + size.line > m_dimensions.line)
+    // The info box does not fit
+    if (pos < rect.pos or pos + size > rect.pos + rect.size)
         return;
 
     m_info.create(pos, size);

@@ -20,12 +20,12 @@ hook global WinSetOption filetype=(?!git-status).* %{
     rmhl git-status-highlight
 }
 
-decl line-flag-list git_blame_flags
-decl line-flag-list git_diff_flags
+decl line-flags git_blame_flags
+decl line-flags git_diff_flags
 
 face GitBlame default,magenta
 
-def -shell-params \
+def -params 1.. \
   -docstring %sh{printf "%%{Git wrapping helper\navailable commands:\n add\n rm\n blame\n commit\n checkout\n diff\n hide-blame\n log\n show\n show-diff\n status\n update-diff}"} \
   -shell-completion %{
     shift $(expr ${kak_token_to_complete})
@@ -62,7 +62,7 @@ def -shell-params \
         (
             echo "eval -client '$kak_client' %{
                       try %{ addhl flag_lines GitBlame git_blame_flags }
-                      set buffer=$kak_bufname git_blame_flags ''
+                      set buffer=$kak_bufname git_blame_flags '$kak_timestamp'
                   }" | kak -p ${kak_session}
                   git blame "$@" --incremental ${kak_buffile} | awk -e '
                   function send_flags(text, flag, i) {
@@ -70,9 +70,9 @@ def -shell-params \
                       text=substr(sha,1,8) " " dates[sha] " " authors[sha]
                       gsub(":", "\\:", text)
                       # gsub("|", "\\|", text)
-                      flag=line "|default|" text
+                      flag=line "|" text
                       for ( i=1; i < count; i++ ) {
-                          flag=flag ":" line+i "|default|" text
+                          flag=flag ":" line+i "|" text
                       }
                       cmd = "kak -p " ENVIRON["kak_session"]
                       print "set -add buffer=" ENVIRON["kak_bufname"] " git_blame_flags %{" flag "}" | cmd
@@ -97,7 +97,7 @@ def -shell-params \
         git diff -U0 $kak_buffile | awk -e '
             BEGIN {
                 line=0
-                flags="0|red|."
+                flags=ENVIRON["kak_timestamp"]
             }
             /^---.*/ {}
             /^@@ -[0-9]+(,[0-9]+)? \+[0-9]+(,[0-9]+)? @@.*/ {
@@ -108,10 +108,10 @@ def -shell-params \
                  }
             }
             /^\+/ {
-                 flags=flags ":" line "|green|+"
+                 flags=flags ":" line "|{green}+"
                  line++
             }
-            /^\-/ { flags=flags ":" line "|red|-" }
+            /^\-/ { flags=flags ":" line "|{red}-" }
             END { print "set buffer git_diff_flags ", flags }
         '
     }

@@ -17,7 +17,7 @@
 namespace Kakoune
 {
 
-class InputMode
+class InputMode : public RefCountable
 {
 public:
     InputMode(InputHandler& input_handler) : m_input_handler(input_handler) {}
@@ -25,7 +25,7 @@ public:
     InputMode(const InputMode&) = delete;
     InputMode& operator=(const InputMode&) = delete;
 
-    void handle_key(Key key) { on_key(key, {}); }
+    void handle_key(Key key) { RefPtr<InputMode> keep_alive{this}; on_key(key); }
 
     virtual void on_enabled() {}
     virtual void on_disabled() {}
@@ -39,21 +39,16 @@ public:
     Insertion& last_insert() { return m_input_handler.m_last_insert; }
 
 protected:
-    // KeepAlive is usedto make sure the current InputMode
-    // stays alive until the end of the on_key method
-    struct KeepAlive { std::shared_ptr<InputMode> ptr; };
-
-    virtual void on_key(Key key, KeepAlive keep_alive) = 0;
+    virtual void on_key(Key key) = 0;
 
     void push_mode(InputMode* new_mode)
     {
         m_input_handler.push_mode(new_mode);
     }
 
-    void pop_mode(KeepAlive& keep_alive)
+    void pop_mode()
     {
-        kak_assert(not keep_alive.ptr);
-        keep_alive.ptr = m_input_handler.pop_mode(this);
+        m_input_handler.pop_mode(this);
     }
 private:
     InputHandler& m_input_handler;
@@ -195,7 +190,7 @@ public:
         context().hooks().run_hook("NormalEnd", "", context());
     }
 
-    void on_key(Key key, KeepAlive keep_alive) override
+    void on_key(Key key) override
     {
         bool do_restore_hooks = false;
         auto restore_hooks = on_scope_end([&, this]{
@@ -231,15 +226,22 @@ public:
         else if (key == '"')
         {
             on_next_key_with_autoinfo(context(), KeymapMode::None,
-                [this](Key key, Context&) {
+                [this](Key key, Context& context) {
                     if (auto cp = key.codepoint())
-                        m_params.reg = *cp;
+                    {
+                        if (*cp <= 127)
+                            m_params.reg = *cp;
+                        else
+                            context.print_status(
+                                { format("invalid register '{}'", *cp),
+                                  get_face("Error") });
+                    }
                 }, "Enter target register", register_doc);
         }
         else
         {
             if (m_single_command)
-                pop_mode(keep_alive);
+                pop_mode();
 
             context().print_status({});
             if (context().has_ui())
@@ -251,7 +253,8 @@ public:
                                        { return lhs.key < rhs; });
             if (it != keymap.end() and it->key == key)
             {
-                if (context().options()["autoinfo"].get<int>() >= 2 and context().has_ui())
+                auto autoinfo = context().options()["autoinfo"].get<AutoInfo>();
+                if (autoinfo & AutoInfo::Normal and context().has_ui())
                     context().ui().info_show(key_to_str(key), it->docstring, CharCoord{},
                                              get_face("Information"), InfoStyle::Prompt);
 
@@ -269,16 +272,16 @@ public:
 
     DisplayLine mode_line() const override
     {
-        AtomList atoms = { { to_string(context().selections().size()) + " sel", Face(Color::Blue) } };
+        AtomList atoms = { { to_string(context().selections().size()) + " sel", get_face("StatusLineInfo") } };
         if (m_params.count != 0)
         {
-            atoms.push_back({ "; param=", Face(Color::Yellow) });
-            atoms.push_back({ to_string(m_params.count), Face(Color::Green) });
+            atoms.push_back({ " param=", get_face("StatusLineInfo") });
+            atoms.push_back({ to_string(m_params.count), get_face("StatusLineValue") });
         }
         if (m_params.reg)
         {
-            atoms.push_back({ "; reg=", Face(Color::Yellow) });
-            atoms.push_back({ StringView(m_params.reg).str(), Face(Color::Green) });
+            atoms.push_back({ " reg=", get_face("StatusLineInfo") });
+            atoms.push_back({ StringView(m_params.reg).str(), get_face("StatusLineValue") });
         }
         return atoms;
     }
@@ -500,7 +503,7 @@ public:
         context().ui().menu_select(0);
     }
 
-    void on_key(Key key, KeepAlive keep_alive) override
+    void on_key(Key key) override
     {
         auto match_filter = [this](const DisplayLine& choice) {
             for (auto& atom : choice)
@@ -517,7 +520,7 @@ public:
             if (context().has_ui())
                 context().ui().menu_hide();
             context().print_status(DisplayLine{});
-            pop_mode(keep_alive);
+            pop_mode();
             int selected = m_selected - m_choices.begin();
             m_callback(selected, MenuEvent::Validate, context());
             return;
@@ -535,7 +538,7 @@ public:
             {
                 if (context().has_ui())
                     context().ui().menu_hide();
-                pop_mode(keep_alive);
+                pop_mode();
                 int selected = m_selected - m_choices.begin();
                 m_callback(selected, MenuEvent::Abort, context());
             }
@@ -585,7 +588,7 @@ public:
 
     DisplayLine mode_line() const override
     {
-        return { "menu", Face(Color::Yellow) };
+        return { "menu", get_face("StatusLineMode") };
     }
 
     KeymapMode keymap_mode() const override { return KeymapMode::Menu; }
@@ -657,7 +660,7 @@ public:
         display();
     }
 
-    void on_key(Key key, KeepAlive keep_alive) override
+    void on_key(Key key) override
     {
         History& history = ms_history[m_prompt];
         const String& line = m_line_editor.line();
@@ -670,7 +673,7 @@ public:
             context().print_status(DisplayLine{});
             if (context().has_ui())
                 context().ui().menu_hide();
-            pop_mode(keep_alive);
+            pop_mode();
             // call callback after pop_mode so that callback
             // may change the mode
             m_callback(line, PromptEvent::Validate, context());
@@ -683,7 +686,7 @@ public:
             context().print_status(DisplayLine{});
             if (context().has_ui())
                 context().ui().menu_hide();
-            pop_mode(keep_alive);
+            pop_mode();
             m_callback(line, PromptEvent::Abort, context());
             return;
         }
@@ -853,7 +856,7 @@ public:
 
     DisplayLine mode_line() const override
     {
-        return { "prompt", Face(Color::Yellow) };
+        return { "prompt", get_face("StatusLineMode") };
     }
 
     KeymapMode keymap_mode() const override { return KeymapMode::Prompt; }
@@ -935,15 +938,15 @@ public:
     NextKey(InputHandler& input_handler, KeymapMode keymap_mode, KeyCallback callback)
         : InputMode(input_handler), m_keymap_mode(keymap_mode), m_callback(std::move(callback)) {}
 
-    void on_key(Key key, KeepAlive keep_alive) override
+    void on_key(Key key) override
     {
-        pop_mode(keep_alive);
+        pop_mode();
         m_callback(key, context());
     }
 
     DisplayLine mode_line() const override
     {
-        return { "enter key", Face(Color::Yellow) };
+        return { "enter key", get_face("StatusLineMode") };
     }
 
     KeymapMode keymap_mode() const override { return m_keymap_mode; }
@@ -964,9 +967,9 @@ public:
           m_autoshowcompl(true),
           m_idle_timer{TimePoint::max(),
                        [this](Timer& timer) {
-                           context().hooks().run_hook("InsertIdle", "", context());
                            if (m_autoshowcompl)
                                m_completer.update();
+                           context().hooks().run_hook("InsertIdle", "", context());
                        }},
           m_disable_hooks{context().user_hooks_disabled()}
     {
@@ -976,6 +979,7 @@ public:
 
         last_insert().mode = mode;
         last_insert().keys.clear();
+        last_insert().disable_hooks = m_disable_hooks;
         context().hooks().run_hook("InsertBegin", "", context());
         prepare(m_insert_mode);
     }
@@ -1004,7 +1008,7 @@ public:
         m_idle_timer.set_next_date(TimePoint::max());
     }
 
-    void on_key(Key key, KeepAlive keep_alive) override
+    void on_key(Key key) override
     {
         auto& buffer = context().buffer();
         last_insert().keys.push_back(key);
@@ -1019,7 +1023,7 @@ public:
             context().hooks().run_hook("InsertEnd", "", context());
 
             m_completer.reset();
-            pop_mode(keep_alive);
+            pop_mode();
         }
         else if (key == Key::Backspace)
         {
@@ -1156,8 +1160,8 @@ public:
     DisplayLine mode_line() const override
     {
         auto num_sel = context().selections().size();
-        return {AtomList{ { "insert ", Face(Color::Green) },
-                          { format( "{} sel", num_sel), Face(Color::Blue) } }};
+        return {AtomList{ { "insert ", get_face("StatusLineMode") },
+                          { format( "{} sel", num_sel), get_face("StatusLineInfo") } }};
     }
 
     KeymapMode keymap_mode() const override { return KeymapMode::Insert; }
@@ -1287,16 +1291,14 @@ void InputHandler::push_mode(InputMode* new_mode)
     new_mode->on_enabled();
 }
 
-std::unique_ptr<InputMode> InputHandler::pop_mode(InputMode* mode)
+void InputHandler::pop_mode(InputMode* mode)
 {
-    kak_assert(m_mode_stack.back() == mode);
+    kak_assert(m_mode_stack.back().get() == mode);
     kak_assert(m_mode_stack.size() > 1);
 
     current_mode().on_disabled();
-    std::unique_ptr<InputMode> res = std::move(m_mode_stack.back());
     m_mode_stack.pop_back();
     current_mode().on_enabled();
-    return res;
 }
 
 void InputHandler::reset_normal_mode()
@@ -1322,6 +1324,8 @@ void InputHandler::repeat_last_insert()
 
     Vector<Key> keys;
     swap(keys, m_last_insert.keys);
+    ScopedSetBool disable_hooks(context().user_hooks_disabled(),
+                                m_last_insert.disable_hooks);
     // context.last_insert will be refilled by the new Insert
     // this is very inefficient.
     push_mode(new InputModes::Insert(*this, m_last_insert.mode));
@@ -1413,13 +1417,15 @@ DisplayLine InputHandler::mode_line() const
     return current_mode().mode_line();
 }
 
-
-bool show_auto_info_ifn(StringView title, StringView info, const Context& context)
+bool show_auto_info_ifn(StringView title, StringView info, AutoInfo mask, const Context& context)
 {
-    if (context.options()["autoinfo"].get<int>() < 1 or not context.has_ui())
+    if (not (context.options()["autoinfo"].get<AutoInfo>() & mask) or
+        not context.has_ui())
         return false;
+
     Face face = get_face("Information");
     context.ui().info_show(title, info, CharCoord{}, face, InfoStyle::Prompt);
     return true;
 }
+
 }
